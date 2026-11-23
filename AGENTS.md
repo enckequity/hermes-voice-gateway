@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Hermes plugin (`kind: platform`) that answers Twilio phone calls, speaks Hermes' replies with ElevenLabs (Pipecat), and places operator-approved callbacks. See [README.md](README.md) for behaviour and setup, [docs/](docs/) for design notes.
+Hermes plugin (`kind: platform`) that answers Twilio phone calls, speaks the agent's replies with the business's own ElevenLabs key (Pipecat), tells callers opening times, takes messages, and places callbacks only after a native approval card. This is the enckequity fork (TeamShift #4638); see the README's fork note. See [README.md](README.md) for behaviour and setup, [docs/](docs/) for design notes.
 
 ## Layout
 The repo root **is** the plugin package (flat modules, relative imports). Hermes loads it by file path.
@@ -8,23 +8,23 @@ The repo root **is** the plugin package (flat modules, relative imports). Hermes
 - `__init__.py`: `register(ctx)` entry point. Must not import Hermes internals, Pipecat or Twilio at load time.
 - `adapter.py`: Twilio call server (`/voice`, `/voice/outbound`, `/media`) and Hermes platform adapter.
 - `callbacks.py`: callback proposals + `/voice-callback` operator approval; state in the plugin SQLite file.
-- `tools.py` / `schemas.py`: agent tools (`voice_propose_callback`, `voice_check_call_status`, `voice_start_local_pipeline`) and their schemas.
-- `caller_tools.py`: restricted `voice_caller` search/enquiry handlers, live-turn permissions and SQLite enquiries. Call ownership comes from gateway context, never model arguments.
+- `tools.py` / `schemas.py`: agent tools (`voice_propose_callback`, `voice_check_call_status`), `/voice-leads`, and all schemas. `voice_place_callback` and its approval directive live in `callbacks.py`.
+- `caller_tools.py`: restricted `voice_caller` availability/lead handlers, live-turn permissions and SQLite leads. `hours.py`: read-only business-hours file.
+- `_engine.py`: every private engine symbol (`_get_platform_tools`, approval presence helpers) behind one guarded lookup that fails closed with `EngineContractError`. Call ownership comes from gateway context, never model arguments.
 - `hooks.py`: `pre_tool_call` guard. `_env.py`: read config/secrets here, not via raw `os.getenv`.
 - `twilio_util.py` (pure: signatures, TwiML, allowlist, stream tokens), `twilio_rest.py` (stdlib REST client, blocking: use `asyncio.to_thread`).
-- `voice_behavior.py`: greeting/profile/guardrails shared by adapter and local pipeline. Plain Python, no Pipecat import.
-- `pipeline.py`, `frontend/`, `scripts/start_local_pipeline.py`: local WebRTC dev loop only.
-- `refurbo_demo.py`, `voice/`: opt-in local demo and sample caller profile/inventory snapshot.
+- `voice_behavior.py`: greeting/profile/guardrails for the adapter. Plain Python, no Pipecat import.
+- `voice/`: caller-profile template and an example hours file (not loaded automatically).
 
 ## Dev environment
 - Python >= 3.11; install runtime and dev dependencies with `pip install -e '.[dev]'` from the repo root. Packaging uses Hatchling (`pyproject.toml`).
-- Phone setup requires `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `ELEVENLABS_API_KEY`, and `VOICE_WEBHOOK_URL`; callbacks also need `TWILIO_PHONE_NUMBER`. The local pipeline needs `ELEVENLABS_API_KEY` and `OPENAI_API_KEY`, not Twilio.
+- Phone setup requires `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `VOICE_ELEVENLABS_API_KEY` (the business's own; never read `ELEVENLABS_API_KEY`), and `VOICE_WEBHOOK_URL`; callbacks also need `TWILIO_PHONE_NUMBER`.
 - The phone server defaults to `127.0.0.1:8081`. Twilio needs a public HTTPS base URL with no trailing slash, an exact `/voice` webhook URL for signature validation, and proxy WebSocket upgrades on `/media`.
 
 ## Commands
 - Tests: `pytest tests` from the repo root (needs the project deps installed, e.g. `pip install -e '.[dev]'`; `test_adapter.py` imports `fastapi`, which comes via Pipecat).
 - Lint: `ruff check .` (dev extra; no repo-specific Ruff configuration).
-- Local voice loop: `python scripts/start_local_pipeline.py`, then open http://127.0.0.1:8765/. This uses OpenAI directly, not Hermes' agent.
+- Engine contract: `PYTHONPATH=<hermes-agent v0.23.3 checkout> python -m pytest <repo>/tests/test_engine_contract.py`, run from outside the repo (the root `tools.py` shadows the engine's `tools` package otherwise).
 - `tests/pytest.ini` makes `tests/` the rootdir so the root `__init__.py` is never imported by pytest; `tests/_hermes_stubs.py` stubs Hermes' `gateway` package and loads the plugin the way Hermes does. Don't run bare `pytest` at the root.
 - No checked-in CI workflow, lockfile, or dedicated build/type-check script; the build backend and explicit packaged-file list live in `pyproject.toml`.
 
@@ -39,14 +39,11 @@ The repo root **is** the plugin package (flat modules, relative imports). Hermes
 ## Pitfalls
 - Voice ingress is deliberately serialized through gateway task cleanup, not just `on_processing_complete`; preserve the guarded `_event_session_key` / `_session_tasks` / `_active_sessions` contract and `tests/test_voice_ingress.py` coverage. Do not re-enable gateway steer/merge for phone turns without per-event terminal receipts.
 - `tests/test_pipecat_version.py` checks the installed Pipecat version too, not just dependency declarations. Shell Python and the Hermes-managed runtime may differ; missing Pipecat is not a valid full-suite environment.
-- The local runner starts signaling and the pipeline in ONE process; running `frontend/signaling-server.py` alone cannot work. Signaling must import after pipeline startup to see the live loop. Restart the single-call runner between calls.
-- `scripts/start_local_pipeline.py` never parses dotenv files. Supply keys in the standalone process environment, or invoke through Hermes so `_env.secret` resolves profile-scoped secrets. `_env.hermes_home` uses `hermes_constants.get_hermes_home()` when Hermes is available; only standalone development falls back to the process environment.
 - `voice/PROFILE.md` is a template, not automatically loaded. Set `VOICE_PROFILE_PATH` or copy it to `<HERMES_HOME>/voice/PROFILE.md`; profiles truncate at 6,000 characters. Set `VOICE_GREETING` separately.
-- `VOICE_REFURBO_DEMO=true` enables local inventory/appointment tools only; it does not add them to the Twilio caller path. Demo appointments persist locally and do not reserve real slots or notify anyone; see `docs/refurbo-demo.md`.
 
 ## Security rules (do not weaken)
-- Phone toolsets must resolve to exactly `voice_search_inventory` and `voice_save_enquiry`; retain the adapter's policy check, deny-by-default caller hook and handler authorization. Revoke grants on every terminal path. Other plugin/MCP/context tools must not expand the caller surface; see README policy prerequisites and `tests/test_caller_tools.py`.
-- Agents may only *propose* callbacks; there is deliberately no agent-callable approve tool, and spoken words never run `/commands`.
-- Twilio webhooks are signature-checked; `VOICE_INSECURE_NO_SIGNATURE` is local-dev only. Callers must be on `VOICE_ALLOWED_USERS` (or explicit `VOICE_ALLOW_ALL_USERS=true`); the allowlist is a filter, not authentication.
-- Never log or commit secrets (`TWILIO_*`, `ELEVENLABS_API_KEY`, `OPENAI_API_KEY`); `.env` is local only (use `.env.example`). Don't log caller transcripts above DEBUG.
-- Refurbo inventory is a stale snapshot; prices are enquiry approximations, not quotes.
+- Phone toolsets must resolve to exactly `voice_check_availability` and `voice_capture_lead`; retain the adapter's policy check, deny-by-default caller hook and handler authorization. Revoke grants on every terminal path. Other plugin/MCP/context tools must not expand the caller surface; see README policy prerequisites and `tests/test_caller_tools.py`.
+- A callback dials only through `voice_place_callback`, whose hook returns the native approve directive (one `rule_key` per callback) or blocks; never add an approve tool or a dial path that skips the hook, and spoken words never run `/commands`.
+- Twilio webhooks are always signature-checked; never reintroduce a bypass such as `VOICE_INSECURE_NO_SIGNATURE`. Callers must be on `VOICE_ALLOWED_USERS` (or explicit `VOICE_ALLOW_ALL_USERS=true`); the allowlist is a filter, not authentication.
+- Never log or commit secrets (`TWILIO_*`, `VOICE_ELEVENLABS_API_KEY`); `.env` is local only (use `.env.example`). Don't log caller transcripts above DEBUG.
+- Nothing callers hear or the owner sees names the engine; `tests/test_plugin_scaffold.py` checks the fixed strings.

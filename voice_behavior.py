@@ -1,4 +1,4 @@
-"""Call behaviour shared by the local pipeline and Twilio adapter: greeting, voice profile, guardrails.
+"""Call behaviour for the Twilio adapter: greeting, voice profile, guardrails.
 
 Plain Python, no Pipecat import, so the plugin still loads without it.
 """
@@ -8,7 +8,7 @@ from pathlib import Path
 
 try:  # plugin package under Hermes
     from ._env import hermes_home, secret
-except ImportError:  # imported top-level by the dev scripts and tests
+except ImportError:  # imported top-level by unit tests
     from _env import hermes_home, secret
 
 DEFAULT_GREETING = "Hi, how can I help you today?"

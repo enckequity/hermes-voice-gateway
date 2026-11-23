@@ -1,7 +1,8 @@
 """Voice tool handlers.
 
 Hermes calls a tool handler as ``handler(args: dict, **kwargs)`` and expects a JSON
-string back (async handlers are registered with ``is_async=True``). Tool names use
+string back (async handlers are registered with ``is_async=True``). ``voice_place_callback`` lives in
+``callbacks.py`` next to its approval directive. Tool names use
 underscores because model APIs reject dots in function names.
 """
 from __future__ import annotations
@@ -9,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 
 from . import twilio_rest
 from ._env import secret
@@ -27,7 +29,7 @@ def _err(message: str) -> str:
 
 
 def propose_callback(args: dict, **kwargs) -> str:
-    """Record a callback request. It is NOT dialed until an operator approves it."""
+    """Record a callback request. It is NOT dialed until a person approves its approval card."""
     destination = str(args.get("destination", "")).strip()
     brief = clean_text(args.get("brief", ""), MAX_BRIEF)
     staff_member = clean_text(args.get("staff_member", ""), 100)
@@ -48,8 +50,9 @@ def propose_callback(args: dict, **kwargs) -> str:
     logger.info("voice_propose_callback stored %s for %s", cb_id, redact_phone(destination))
     return _ok(
         callback_id=cb_id,
-        status="pending_operator_approval",
-        note=f"Nothing will be dialed until an operator runs: /voice-callback approve {cb_id}",
+        status="pending_approval",
+        note=(f"Recorded, not dialed. Call voice_place_callback with callback_id {cb_id} to ask for approval; "
+              "it dials only if the person approves the approval card."),
     )
 
 
@@ -97,8 +100,23 @@ def check_call_status(args: dict, **kwargs) -> str:
     )
 
 
-async def start_local_pipeline(args: dict, **kwargs) -> str:
-    """Dev only: start the local WebRTC test pipeline (keys come from the environment)."""
-    from .pipeline import start_local_pipeline as _start
+async def leads_command(raw_args: str = "") -> str:
+    """Slash command ``/voice-leads [count]``: the latest messages callers left."""
+    from .caller_tools import open_caller_store
 
-    return json.dumps(await _start())
+    arg = (raw_args or "").strip()
+    limit = int(arg) if arg.isdecimal() and 0 < int(arg) <= 200 else 20
+    try:
+        with open_caller_store() as store:
+            rows = store.leads(limit)
+    except sqlite3.Error:
+        logger.exception("[voice] lead storage error")
+        return "Message storage is unavailable right now; try again."
+    if not rows:
+        return "No phone messages yet."
+    lines = []
+    for row in rows:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(row["created_at"]))
+        reach = f" (call back on {row['callback_number']})" if row["callback_number"] else ""
+        lines.append(f"{when}  {row['name']}  {row['phone']}{reach}: {json.dumps(row['reason'])}")
+    return "\n".join(lines)

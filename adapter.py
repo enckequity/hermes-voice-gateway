@@ -1,4 +1,4 @@
-"""Voice (Twilio phone calls) platform adapter for Hermes.
+"""Voice (Twilio phone calls) platform adapter.
 
 Call flow:
   1. Twilio POSTs the call to ``{VOICE_WEBHOOK_URL}/voice``. We verify the Twilio
@@ -30,6 +30,7 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 
 from . import caller_tools
+from ._engine import EngineContractError
 from ._env import secret
 from . import voice_behavior as vb
 from .callbacks import ID_RE, clean_text, open_store
@@ -92,7 +93,7 @@ class VoiceAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("voice"))
         self._account_sid = secret("TWILIO_ACCOUNT_SID")
         self._auth_token = secret("TWILIO_AUTH_TOKEN").strip()
-        self._elevenlabs_key = secret("ELEVENLABS_API_KEY")
+        self._elevenlabs_key = secret("VOICE_ELEVENLABS_API_KEY")  # the business's own key; no shared default
         self._webhook_url = secret("VOICE_WEBHOOK_URL").strip().rstrip("/")
         self._host = secret("VOICE_WEBHOOK_HOST", DEFAULT_HOST)
         self._port = int(secret("VOICE_WEBHOOK_PORT", str(DEFAULT_PORT)))
@@ -100,7 +101,6 @@ class VoiceAdapter(BasePlatformAdapter):
         self._max_call_seconds = int(secret("VOICE_MAX_CALL_SECONDS", str(DEFAULT_MAX_CALL_SECONDS)))
         self._allowed = parse_allowed(secret("VOICE_ALLOWED_USERS"))
         self._allow_all = secret("VOICE_ALLOW_ALL_USERS").lower() == "true"
-        self._insecure = secret("VOICE_INSECURE_NO_SIGNATURE").lower() == "true"
         self._stt_model = secret("ELEVENLABS_STT_MODEL", "scribe_v2")
         self._tts_model = secret("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5")
         self._voice_id = secret("ELEVENLABS_VOICE_ID")
@@ -119,10 +119,14 @@ class VoiceAdapter(BasePlatformAdapter):
             logger.error("[voice] %s", problem)
             self._set_fatal_error("voice_misconfigured", problem, retryable=False)
             return False
-        if self._insecure:
-            logger.warning(
-                "[voice] VOICE_INSECURE_NO_SIGNATURE=true: Twilio signature checks are OFF. "
-                "Dev only; anyone who can reach port %d can start calls.", self._port)
+        if secret("VOICE_INSECURE_NO_SIGNATURE"):
+            logger.warning("[voice] VOICE_INSECURE_NO_SIGNATURE is ignored: Twilio signatures are always verified")
+        try:
+            caller_tools.verify_runtime_contract()
+        except (PermissionError, RuntimeError, ImportError) as exc:
+            logger.error("[voice] %s", exc)
+            self._set_fatal_error("voice_unsafe_profile", str(exc), retryable=False)
+            return False
         import uvicorn
 
         config = uvicorn.Config(self._build_app(), host=self._host, port=self._port, log_level="warning")
@@ -164,11 +168,17 @@ class VoiceAdapter(BasePlatformAdapter):
         missing = [name for name, val in (
             ("TWILIO_ACCOUNT_SID", self._account_sid),
             ("TWILIO_AUTH_TOKEN", self._auth_token),
-            ("ELEVENLABS_API_KEY", self._elevenlabs_key),
             ("VOICE_WEBHOOK_URL", self._webhook_url),
         ) if not val]
+        if not self._elevenlabs_key:
+            missing.append("VOICE_ELEVENLABS_API_KEY")
         if missing:
-            return "missing " + ", ".join(missing)
+            problem = "missing " + ", ".join(missing)
+            if not self._elevenlabs_key:
+                problem += (". Phone calls need the business's own ElevenLabs API key (speech-to-text and the "
+                            "spoken voice) in VOICE_ELEVENLABS_API_KEY; there is no shared default key, so the "
+                            "voice line stays off until it is set")
+            return problem
         if not self._webhook_url.startswith("https://"):
             return "VOICE_WEBHOOK_URL must start with https:// (Twilio only opens wss:// streams)"
         if not self._allow_all and not self._allowed:
@@ -336,11 +346,11 @@ class VoiceAdapter(BasePlatformAdapter):
         raw = b"".join(chunks)
         form = urllib.parse.parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
         params = {k: v[0] for k, v in form.items() if v}
-        if not self._insecure:
-            signature = request.headers.get("x-twilio-signature", "")
-            if not validate_signature(self._auth_token, url, params, signature):
-                logger.warning("[voice] rejected webhook: missing or invalid Twilio signature")
-                return None, (403, twiml_reject("Forbidden."))
+        # Always verified: there is deliberately no switch to turn this off.
+        signature = request.headers.get("x-twilio-signature", "")
+        if not validate_signature(self._auth_token, url, params, signature):
+            logger.warning("[voice] rejected webhook: missing or invalid Twilio signature")
+            return None, (403, twiml_reject("Forbidden."))
         return params, None
 
     def _admit(self, caller: str, call_sid: str, extra: dict[str, str] | None = None) -> tuple[int, str]:
@@ -662,6 +672,9 @@ class VoiceAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 await self._settle_event(call, event_id, "cancelled")
                 raise
+            except EngineContractError as exc:
+                logger.error("[voice] %s", exc)
+                await self._settle_event(call, event_id, "failure")
             except Exception:
                 logger.warning("[voice] ingress failed or gateway task contract unsupported for %s", redact_phone(call.caller))
                 await self._settle_event(call, event_id, "failure")

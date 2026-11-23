@@ -2,30 +2,30 @@ name: hermes-voice-gateway
 version: "0.2.0"
 manifest_version: 2
 api_version: 1
-description: "Voice platform for Hermes: answers Twilio phone calls, speaks Hermes' replies with ElevenLabs, and places operator-approved callbacks. Includes a local WebRTC dev pipeline."
+description: "Phone line for your assistant: answers Twilio calls, tells callers your opening times, takes messages, and places callbacks only after you approve them. Uses your own ElevenLabs key for speech."
 kind: platform
 license: MIT
-homepage: https://github.com/SRai22/hermes-voice-gateway
+homepage: https://github.com/enckequity/hermes-voice-gateway
 tags: [voice, gateway, twilio, pipecat, phone, calls, elevenlabs]
 requires_env:
   - name: TWILIO_ACCOUNT_SID
     description: Twilio Account SID
     password: true
   - name: TWILIO_AUTH_TOKEN
-    description: Twilio Auth Token (also used to verify webhook signatures)
+    description: Twilio Auth Token (also used to verify webhook signatures, which are always checked)
     password: true
-  - name: ELEVENLABS_API_KEY
-    description: ElevenLabs API key for speech-to-text and text-to-speech
+  - name: VOICE_ELEVENLABS_API_KEY
+    description: "The business's own ElevenLabs API key (speech-to-text and the spoken voice). Required: there is no shared default key"
     password: true
   - name: VOICE_WEBHOOK_URL
     description: "Public https base URL Twilio can reach (no trailing slash). Set the number's voice webhook to <this>/voice"
     password: false
 optional_env:
   - name: VOICE_ALLOWED_USERS
-    description: Comma-separated caller numbers (E.164) allowed to talk to Hermes. Required unless VOICE_ALLOW_ALL_USERS=true
+    description: Comma-separated caller numbers (E.164) allowed to call in and to be called back. Required unless VOICE_ALLOW_ALL_USERS=true. Caller ID can be spoofed; this is a filter, not authentication
     password: false
   - name: VOICE_ALLOW_ALL_USERS
-    description: "true lets any caller in (not recommended)"
+    description: "true lets any caller in (callbacks still go only to VOICE_ALLOWED_USERS)"
     password: false
   - name: VOICE_WEBHOOK_HOST
     description: Local bind address for the call server (default 127.0.0.1)
@@ -34,37 +34,34 @@ optional_env:
     description: Local port for the call server (default 8081)
     password: false
   - name: VOICE_MAX_CALL_SECONDS
-    description: Longest a call may last before Hermes says goodbye and hangs up (default 1800; 0 = no limit)
+    description: Longest a call may last before the assistant says goodbye and hangs up (default 1800; 0 = no limit)
     password: false
   - name: VOICE_MAX_CALLS
     description: Maximum simultaneous calls (default 5)
     password: false
-  - name: VOICE_INSECURE_NO_SIGNATURE
-    description: "true turns off Twilio signature checks. Local dev only"
-    password: false
   - name: VOICE_GREETING
-    description: "What the agent says when a call connects (default: Hi, how can I help you today?). off = no greeting"
+    description: "What the assistant says when a call connects (default: Hi, how can I help you today?). off = no greeting"
     password: false
   - name: VOICE_PROFILE_PATH
-    description: "Voice-mode profile (system prompt for calls). Default <HERMES_HOME>/voice/PROFILE.md; built-in short-reply profile if missing"
+    description: "Voice-mode instructions for calls. Default <HERMES_HOME>/voice/PROFILE.md; built-in short-reply instructions if missing"
+    password: false
+  - name: VOICE_HOURS_PATH
+    description: "Business hours file read by voice_check_availability. Default <HERMES_HOME>/voice/hours.json"
     password: false
   - name: ELEVENLABS_VOICE_ID
     description: ElevenLabs voice for replies
     password: false
-  - name: OPENAI_API_KEY
-    description: Only for the local dev pipeline (voice_start_local_pipeline)
-    password: true
   - name: TWILIO_PHONE_NUMBER
-    description: Outbound caller ID (E.164). Required to dial approved callbacks
+    description: Outbound caller ID (E.164). Required to place approved callbacks
     password: false
 provides_tools:
   - voice_propose_callback
+  - voice_place_callback
   - voice_check_call_status
-  - voice_start_local_pipeline
-  - voice_search_inventory
-  - voice_save_enquiry
+  - voice_check_availability
+  - voice_capture_lead
 provides_hooks:
   - pre_tool_call
 python_dependencies:
-  - "pipecat-ai[elevenlabs,openai,silero,webrtc,websocket]==1.7.0"
+  - "pipecat-ai[elevenlabs,silero,websocket]==1.7.0"
   - "uvicorn>=0.32,<1"

@@ -1,4 +1,4 @@
-"""Callback proposals, the /voice-callback approval command, and call status."""
+"""Callback proposals, the native approval card on the dial, /voice-callback, and call status."""
 from __future__ import annotations
 
 import asyncio
@@ -47,13 +47,20 @@ def command(env, text):
     return asyncio.run(env.callbacks.callback_command(text))
 
 
+def place(env, cb):
+    """Run the dial handler (the step after an approved card); return its message."""
+    out = json.loads(asyncio.run(env.callbacks.place_callback({"callback_id": cb})))
+    return out.get("status") or out.get("error")
+
+
 # -- propose_callback ---------------------------------------------------------
 
 def test_propose_records_pending_and_does_not_dial(env, monkeypatch) -> None:
     dialed = []
     monkeypatch.setattr(env.rest, "create_call", lambda *a, **k: dialed.append(k))
     out = propose(env)
-    assert out["ok"] and out["status"] == "pending_operator_approval"
+    assert out["ok"] and out["status"] == "pending_approval"
+    assert "voice_place_callback" in out["note"] and "approval card" in out["note"]
     assert len(out["callback_id"]) == 8 and out["callback_id"] in out["note"]
     assert dialed == []
     assert env.conn.execute("SELECT status FROM callbacks").fetchone() == ("pending",)
@@ -106,7 +113,7 @@ def test_list_show_deny(env) -> None:
 def test_bad_ids_and_unknown_actions_print_usage(env) -> None:
     assert "Usage" in command(env, "approve nope")
     assert "Usage" in command(env, "frobnicate")
-    assert "No callback" in command(env, "approve 00000000")
+    assert "No callback" in place(env, "00000000")
 
 
 def test_approve_dials_once_with_the_outbound_url(env, monkeypatch) -> None:
@@ -118,12 +125,12 @@ def test_approve_dials_once_with_the_outbound_url(env, monkeypatch) -> None:
         return {"sid": SID}
 
     monkeypatch.setattr(env.rest, "create_call", fake_create)
-    msg = command(env, f"approve {cb}")
+    msg = place(env, cb)
     assert SID in msg
     assert calls == [("AC1", DEST, "+15559990000", f"https://example.test/voice/outbound?cb={cb}")]
     row = env.callbacks.CallbackStore(env.conn).get(cb)
     assert row["status"] == "dialing" and row["call_sid"] == SID
-    assert "only pending" in command(env, f"approve {cb}")  # no second dial
+    assert "only pending" in place(env, cb)  # no second dial
     assert len(calls) == 1
 
 
@@ -134,20 +141,20 @@ def test_approve_reports_twilio_failure_and_never_retries(env, monkeypatch) -> N
         raise env.rest.TwilioError(400, "invalid number")
 
     monkeypatch.setattr(env.rest, "create_call", boom)
-    assert "invalid number" in command(env, f"approve {cb}")
+    assert "invalid number" in place(env, cb)
     row = env.callbacks.CallbackStore(env.conn).get(cb)
     assert row["status"] == "failed" and "invalid number" in row["error"]
-    assert "only pending" in command(env, f"approve {cb}")
+    assert "only pending" in place(env, cb)
 
 
 def test_approve_refuses_without_config_or_after_allowlist_change(env, monkeypatch) -> None:
     cb = propose(env)["callback_id"]
     monkeypatch.setattr(env.rest, "create_call", lambda *a, **k: pytest.fail("must not dial"))
     monkeypatch.setenv("TWILIO_PHONE_NUMBER", "")
-    assert "Cannot dial" in command(env, f"approve {cb}")
+    assert "Cannot dial" in place(env, cb)
     monkeypatch.setenv("TWILIO_PHONE_NUMBER", "+15559990000")
     monkeypatch.setenv("VOICE_ALLOWED_USERS", "+15557778888")
-    assert "no longer" in command(env, f"approve {cb}")
+    assert "no longer" in place(env, cb)
     assert env.callbacks.CallbackStore(env.conn).get(cb)["status"] == "pending"
 
 
@@ -156,7 +163,7 @@ def test_old_proposals_expire(env, monkeypatch) -> None:
     later = env.callbacks.CallbackStore(env.conn, clock=lambda: 10**10)
     assert later.get(cb)["status"] == "expired"
     monkeypatch.setattr(env.rest, "create_call", lambda *a, **k: pytest.fail("must not dial"))
-    assert "only pending" in command(env, f"approve {cb}")
+    assert "only pending" in place(env, cb)
 
 
 def test_answer_matches_once_and_only_the_dialed_number(env) -> None:
@@ -212,12 +219,13 @@ def test_status_errors(env, monkeypatch) -> None:
     assert "not found" in status(env, call_sid=SID)["error"]
 
 
-# -- Hermes' call convention ----------------------------------------------------
+# -- Tool call convention ----------------------------------------------------
 
 def test_handlers_take_args_dict_and_return_json_strings(env) -> None:
     assert isinstance(env.tools.propose_callback({}), str)
     assert isinstance(env.tools.check_call_status({}, task_id="t"), str)  # extra context kwargs are fine
-    assert json.loads(asyncio.run(env.tools.start_local_pipeline({}))).get("ok") is False  # no keys set
+    assert json.loads(asyncio.run(env.callbacks.place_callback({}))).get("ok") is False
+    assert not hasattr(env.tools, "start_local_pipeline")
 
 
 # -- Twilio REST wrapper --------------------------------------------------------
@@ -276,7 +284,7 @@ def test_unexpected_dial_error_marks_the_row_failed(env, monkeypatch) -> None:
         raise RuntimeError("socket exploded")
 
     monkeypatch.setattr(env.rest, "create_call", boom)
-    assert "unexpected" in command(env, f"approve {cb}")
+    assert "unexpected" in place(env, cb)
     assert env.callbacks.CallbackStore(env.conn).get(cb)["status"] == "failed"
 
 
@@ -308,3 +316,102 @@ def test_twilio_errors_are_scrubbed_and_every_transport_failure_is_wrapped(env, 
     monkeypatch.setattr(env.rest.urllib.request, "urlopen", lambda r, timeout: Resp(b"<html>oops"))
     with pytest.raises(env.rest.TwilioError):
         env.rest.fetch_call("AC1", "t", SID)
+
+
+# -- Native approval card on voice_place_callback --------------------------------
+
+def _gate(monkeypatch, *, presence=(None, False, True, False), yolo=False, mode="manual", missing=None):
+    """Stand in for the engine's private approval helpers (checked against v0.23.3)."""
+    import types
+
+    approval = types.ModuleType("tools.approval")
+    context = types.ModuleType("tools.approval_context")
+    if missing != "_presence":
+        approval._presence = lambda: presence
+    approval._yolo_active = lambda: yolo
+    context._get_approval_mode = lambda: mode
+    monkeypatch.setitem(sys.modules, "tools", types.ModuleType("tools"))
+    monkeypatch.setitem(sys.modules, "tools.approval", approval)
+    monkeypatch.setitem(sys.modules, "tools.approval_context", context)
+
+
+def hook(env, cb):
+    hooks = importlib.import_module(PACKAGE + ".hooks")
+    return hooks.on_pre_tool_call(tool_name="voice_place_callback", args={"callback_id": cb})
+
+
+def test_place_returns_an_approve_directive_with_one_rule_key_per_callback(env, monkeypatch) -> None:
+    _gate(monkeypatch)
+    monkeypatch.setenv("VOICE_ALLOWED_USERS", f"{DEST},+15550002222")
+    first, second = propose(env)["callback_id"], propose(env, destination="+15550002222")["callback_id"]
+    a, b = hook(env, first), hook(env, second)
+    assert a["action"] == b["action"] == "approve"
+    assert a["rule_key"].startswith(f"voice_callback:{first}:")
+    assert b["rule_key"].startswith(f"voice_callback:{second}:")
+    assert a["rule_key"] != b["rule_key"]
+    assert DEST in a["message"] and "Confirm tomorrow's appointment" in a["message"] and "unverified" in a["message"]
+    assert hook(env, first) == a  # stable for the same callback
+
+
+def test_rule_key_binds_number_and_purpose(env) -> None:
+    row = {"id": "abcd1234", "destination": DEST, "brief": "one", "staff_member": ""}
+    keys = {env.callbacks.rule_key(row), env.callbacks.rule_key({**row, "brief": "two"}),
+            env.callbacks.rule_key({**row, "destination": "+15550002222"})}
+    assert len(keys) == 3
+
+
+@pytest.mark.parametrize("gate", [
+    {"presence": (None, False, False, False)},  # cron / single query / unattended: nobody to ask
+    {"yolo": True},
+    {"mode": "off"},
+    {"missing": "_presence"},  # engine contract drift fails closed
+])
+def test_place_is_blocked_where_the_gate_would_not_ask_a_person(env, monkeypatch, gate) -> None:
+    _gate(monkeypatch, **gate)
+    cb = propose(env)["callback_id"]
+    out = hook(env, cb)
+    assert out["action"] == "block" and out["message"].startswith("Not dialed")
+    assert env.callbacks.CallbackStore(env.conn).get(cb)["status"] == "pending"
+
+
+@pytest.mark.parametrize("case", ["bad_id", "unknown", "denied", "no_from_number", "not_allowed"])
+def test_place_is_blocked_before_the_card_when_it_could_not_dial(env, monkeypatch, case) -> None:
+    _gate(monkeypatch)
+    cb = propose(env)["callback_id"]
+    if case == "bad_id":
+        cb = "../x"
+    elif case == "unknown":
+        cb = "00000000"
+    elif case == "denied":
+        command(env, f"deny {cb}")
+    elif case == "no_from_number":
+        monkeypatch.setenv("TWILIO_PHONE_NUMBER", "")
+    else:
+        monkeypatch.setenv("VOICE_ALLOWED_USERS", "+15557778888")
+    assert hook(env, cb)["action"] == "block"
+
+
+def test_place_from_a_phone_call_is_blocked_not_carded(env, monkeypatch) -> None:
+    _gate(monkeypatch)
+    cb = propose(env)["callback_id"]
+    caller_tools = importlib.import_module(PACKAGE + ".caller_tools")
+    monkeypatch.setattr(caller_tools, "is_voice_context", lambda: True)
+    assert hook(env, cb)["action"] == "block"
+
+
+def test_slash_approve_no_longer_dials_and_points_at_the_card(env, monkeypatch) -> None:
+    cb = propose(env)["callback_id"]
+    monkeypatch.setattr(env.rest, "create_call", lambda *a, **k: pytest.fail("must not dial"))
+    msg = command(env, f"approve {cb}")
+    assert "approval card" in msg and cb in msg
+    assert env.callbacks.CallbackStore(env.conn).get(cb)["status"] == "pending"
+    assert "approve" not in env.callbacks.USAGE.split("\n")[0]
+
+
+def test_directive_shape_is_what_the_engine_reads(env, monkeypatch) -> None:
+    """Mirror hermes-agent v0.23.3 hermes_cli/plugins.py: approve reads a str rule_key and an optional str message."""
+    _gate(monkeypatch)
+    out = hook(env, propose(env)["callback_id"])
+    assert set(out) == {"action", "rule_key", "message"}
+    assert isinstance(out["rule_key"], str) and out["rule_key"].strip() == out["rule_key"]
+    assert isinstance(out["message"], str) and out["message"]

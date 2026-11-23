@@ -27,7 +27,7 @@ CALLER = "+15550001111"
 ENV = {
     "TWILIO_ACCOUNT_SID": "AC1",
     "TWILIO_AUTH_TOKEN": TOKEN,
-    "ELEVENLABS_API_KEY": "el",
+    "VOICE_ELEVENLABS_API_KEY": "el",
     "VOICE_WEBHOOK_URL": BASE,
     "VOICE_ALLOWED_USERS": CALLER,
 }
@@ -48,6 +48,7 @@ def make(monkeypatch):
         mod = load_adapter_module()
         use_memory_db(monkeypatch)
         monkeypatch.setattr(mod.caller_tools, "verify_tool_surface", lambda: None)
+        monkeypatch.setattr(mod.caller_tools, "verify_runtime_contract", lambda: None)
         adapter = mod.VoiceAdapter(config=object())
         return adapter, TestClient(adapter._build_app())
 
@@ -101,9 +102,62 @@ def test_oversized_body_is_413(make) -> None:
     assert resp.status_code == 413
 
 
-def test_insecure_mode_skips_signature(make) -> None:
-    _, client = make(VOICE_INSECURE_NO_SIGNATURE="true")
-    assert "<Connect>" in _post_voice(client, PARAMS, signature=False).text
+@pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes"])
+@pytest.mark.parametrize("signature", [False, "", "bad-signature"])
+def test_insecure_no_signature_cannot_be_enabled(make, value, signature) -> None:
+    adapter, client = make(VOICE_INSECURE_NO_SIGNATURE=value)
+    resp = _post_voice(client, PARAMS, signature=signature)
+    assert resp.status_code == 403 and "<Connect>" not in resp.text
+    assert not hasattr(adapter, "_insecure")
+
+
+def test_insecure_flag_is_ignored_with_a_warning_and_the_server_still_verifies(make, caplog) -> None:
+    import logging
+
+    adapter, _ = make(VOICE_INSECURE_NO_SIGNATURE="true", VOICE_WEBHOOK_PORT=str(_free_port()))
+
+    async def run():
+        assert await adapter.connect() is True
+        await adapter.disconnect()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(run())
+    assert "ignored" in caplog.text and "always verified" in caplog.text
+
+
+def test_no_source_file_reads_the_signature_bypass() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for path in root.glob("*.py"):
+        text = path.read_text()
+        if "VOICE_INSECURE_NO_SIGNATURE" in text:
+            # Only the warning that it is ignored may name it.
+            assert path.name == "adapter.py" and text.count("VOICE_INSECURE_NO_SIGNATURE") == 2, path
+
+
+def test_missing_own_elevenlabs_key_refuses_with_a_clear_message(make, monkeypatch) -> None:
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "shared-key-must-not-be-used")
+    adapter, _ = make(VOICE_ELEVENLABS_API_KEY="")
+    problem = adapter._config_problem()
+    assert "VOICE_ELEVENLABS_API_KEY" in problem and "own ElevenLabs API key" in problem
+    assert "no shared default key" in problem
+    assert asyncio.run(adapter.connect()) is False
+    assert adapter.fatal[0] == "voice_misconfigured" and adapter._server is None
+    assert adapter._elevenlabs_key == ""
+
+
+@pytest.mark.parametrize("failure", ["memory", "engine"])
+def test_connect_refuses_unsafe_profile_or_missing_engine_symbol(make, monkeypatch, failure) -> None:
+    adapter, _ = make(VOICE_WEBHOOK_PORT=str(_free_port()))
+    mod = sys.modules[type(adapter).__module__]
+
+    def broken():
+        if failure == "memory":
+            raise PermissionError("caller profile must disable memory.memory_enabled")
+        raise mod.EngineContractError("the voice gateway needs hermes_cli.tools_config._get_platform_tools")
+
+    monkeypatch.setattr(mod.caller_tools, "verify_runtime_contract", broken)
+    assert asyncio.run(adapter.connect()) is False
+    assert adapter.fatal[0] == "voice_unsafe_profile" and adapter._server is None
 
 
 def test_config_problems_are_reported(make) -> None:

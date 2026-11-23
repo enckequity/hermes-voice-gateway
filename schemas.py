@@ -15,11 +15,11 @@ PROPOSE_CALLBACK_SCHEMA = {
         },
         "brief": {
             "type": "string",
-            "description": "One sentence on why the call is made. The operator reads it before approving, and it is given to the agent as the call's purpose.",
+            "description": "One sentence on why the call is made. It is shown on the approval card, and it is given to the assistant as the call's purpose.",
         },
         "staff_member": {
             "type": "string",
-            "description": "Staff member who asked Hermes to propose the callback.",
+            "description": "Staff member who asked for the callback.",
         },
     },
     "required": ["destination", "brief"],
@@ -41,39 +41,40 @@ CHECK_STATUS_SCHEMA = {
     "additionalProperties": False,
 }
 
-# No arguments: keys are read from ELEVENLABS_API_KEY / OPENAI_API_KEY in the
-# environment so secrets never pass through the model or its transcript.
-LOCAL_PIPELINE_SCHEMA = {
+PLACE_CALLBACK_SCHEMA = {
     "type": "object",
-    "properties": {},
+    "properties": {
+        "callback_id": {
+            "type": "string",
+            "description": "Id returned by voice_propose_callback. The person is shown an approval card; nothing dials unless they approve it.",
+        },
+    },
+    "required": ["callback_id"],
     "additionalProperties": False,
 }
 
-CALLER_INVENTORY_SCHEMA = {
+CALLER_AVAILABILITY_SCHEMA = {
     "type": "object",
     "properties": {
-        "model": {"type": "string", "maxLength": 200, "description": "Model/title search tokens."},
-        "budget_inr": {"type": "integer", "minimum": 1, "description": "Maximum budget in INR, if known."},
-        "ram_gb": {"type": "integer", "minimum": 1, "description": "Minimum RAM GB, if known."},
-        "ssd_gb": {"type": "integer", "minimum": 1, "description": "Minimum SSD GB, if known; 1TB = 1024GB."},
-        "limit": {"type": "integer", "minimum": 1, "maximum": 5},
+        "date": {"type": "string", "maxLength": 10,
+                 "description": "First day to check, YYYY-MM-DD in the business's timezone. Default today."},
+        "days": {"type": "integer", "minimum": 1, "maximum": 7, "description": "How many days to show (default 1)."},
     },
     "additionalProperties": False,
 }
 
-CALLER_ENQUIRY_SCHEMA = {
+CALLER_LEAD_SCHEMA = {
     "type": "object",
     "properties": {
-        "name": {"type": "string", "minLength": 1, "maxLength": 200},
-        "requirements": {"type": "string", "minLength": 1, "maxLength": 1000,
-                         "description": "Confirmed laptop requirements; state unknown details as unknown."},
+        "name": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Caller's name as they gave it."},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 1000,
+                   "description": "Why they called / what they need, confirmed with the caller."},
+        "callback_number": {"type": "string", "maxLength": 16,
+                            "description": "Only if the caller asks to be reached on a different number (E.164). "
+                                           "Their calling number is recorded automatically."},
         "consent": {"type": "boolean", "enum": [True],
-                    "description": "Caller explicitly agreed to saving these details with their current caller number."},
-        "model": {"type": "string", "minLength": 1, "maxLength": 200},
-        "budget_inr": {"type": "integer", "minimum": 1},
-        "ram_gb": {"type": "integer", "minimum": 1},
-        "ssd_gb": {"type": "integer", "minimum": 1},
+                    "description": "Caller explicitly agreed to saving their name, number and reason for follow-up."},
     },
-    "required": ["name", "requirements", "consent"],
+    "required": ["name", "reason", "consent"],
     "additionalProperties": False,
 }

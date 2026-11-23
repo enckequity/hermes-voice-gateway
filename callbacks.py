@@ -1,8 +1,12 @@
-"""Callback requests and the operator approval flow.
+"""Callback requests and their approval through the engine's native approval cards.
 
-The agent can only *propose* a callback (``voice_propose_callback``). Nothing dials
-until a human runs ``/voice-callback approve <id>`` in Hermes. There is deliberately
-no agent-callable approve tool, and spoken words cannot run slash commands.
+The agent *proposes* a callback (``voice_propose_callback``), then asks to dial it
+with ``voice_place_callback``. That tool's ``pre_tool_call`` hook returns the
+engine's ``{"action": "approve", "rule_key", "message"}`` directive with one rule
+key per callback, so the dial waits on the same approval card as any other
+flagged action and runs only if a person approves it. There is no agent-callable
+way to approve, contexts where the gate would not ask a person (yolo, approvals
+off, cron, unattended) are refused, and spoken words cannot run slash commands.
 
 State lives in the plugin's SQLite file (``plugin_db``), so a tool call and the
 command see the same data even when they run in different processes.
@@ -10,6 +14,7 @@ command see the same data even when they run in different processes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -167,11 +172,88 @@ def open_store():
         _release(conn)
 
 
-# -- /voice-callback operator command ---------------------------------------
+# -- Approval card ----------------------------------------------------------
+
+RULE_PREFIX = "voice_callback"
+
+
+def rule_key(row: dict) -> str:
+    """One approval rule per callback, bound to its number and purpose.
+
+    Ids are never reused (rows are kept), and the digest means an "always" answer
+    cannot carry over to a different number or purpose.
+    """
+    digest = hashlib.sha256(f'{row["id"]}|{row["destination"]}|{row["brief"]}'.encode()).hexdigest()[:12]
+    return f"{RULE_PREFIX}:{row['id']}:{digest}"
+
+
+def approval_message(row: dict) -> str:
+    who = row["staff_member"] or "not given"
+    return (f"Place a phone call to {row['destination']}?\n"
+            f"Purpose: {row['brief']}\n"
+            f"Requested by: {who} (unverified). The assistant speaks on the call when they answer.")
+
+
+def dial_problem(row: dict | None, cb_id: str) -> str:
+    """Why this callback cannot be dialed now, or "" (checked before the card and again before dialing)."""
+    if row is None:
+        return f"No callback {cb_id}."
+    if row["status"] != "pending":
+        return f"{cb_id} is {row['status']}; only pending callbacks can be placed."
+    if not (secret("TWILIO_ACCOUNT_SID") and secret("TWILIO_AUTH_TOKEN") and secret("TWILIO_PHONE_NUMBER")
+            and secret("VOICE_WEBHOOK_URL").strip().startswith("https://")):
+        return "Cannot dial: set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER and an https VOICE_WEBHOOK_URL."
+    if row["destination"] not in parse_allowed(secret("VOICE_ALLOWED_USERS")):
+        return f"Refused: {row['destination']} is no longer on VOICE_ALLOWED_USERS."
+    return ""
+
+
+def approval_directive(args) -> dict:
+    """``pre_tool_call`` result for ``voice_place_callback``: an approval card, or a block."""
+    from . import _engine
+
+    cb_id = str((args or {}).get("callback_id", "")).strip().lower()
+    if not ID_RE.match(cb_id):
+        return {"action": "block", "message": "Give the callback_id returned by voice_propose_callback."}
+    try:
+        with open_store() as store:
+            row = store.get(cb_id)
+    except sqlite3.Error:
+        logger.exception("[voice] callback storage error")
+        return {"action": "block", "message": "Callback storage is unavailable right now; nothing was dialed."}
+    problem = dial_problem(row, cb_id)
+    if problem:
+        return {"action": "block", "message": problem}
+    try:
+        problem = _engine.approval_bypass_problem()
+    except Exception as exc:  # contract drift or a gate error: never let the dial through unasked
+        logger.warning("[voice] approval gate check failed: %s", exc)
+        problem = "the approval gate could not be checked"
+    if problem:
+        return {"action": "block", "message": f"Not dialed: {problem}. Ask again from a chat where the owner can approve it."}
+    return {"action": "approve", "rule_key": rule_key(row), "message": approval_message(row)}
+
+
+async def place_callback(args: dict, **kwargs) -> str:
+    """Dial an approved callback. Reached only after the approval card (``approval_directive``) was approved."""
+    cb_id = str((args or {}).get("callback_id", "")).strip().lower()
+    if not ID_RE.match(cb_id):
+        return json.dumps({"ok": False, "error": "give the callback_id returned by voice_propose_callback"})
+    try:
+        with open_store() as store:
+            message = await _dial(store, cb_id, store.get(cb_id))
+    except sqlite3.Error:
+        logger.exception("[voice] callback storage error")
+        return json.dumps({"ok": False, "error": "callback storage is unavailable right now"})
+    ok = message.startswith("Dialing")
+    return json.dumps({"ok": ok, ("status" if ok else "error"): message})
+
+
+# -- /voice-callback command (list, show, deny) -------------------------------
 
 USAGE = (
-    "Usage: /voice-callback list | show <id> | approve <id> | deny <id>\n"
-    "Callbacks are proposed by the agent and only dial after you approve them here."
+    "Usage: /voice-callback list | show <id> | deny <id>\n"
+    "Callbacks dial only after you approve the approval card that appears when the assistant places one."
 )
 
 
@@ -181,7 +263,7 @@ def _describe(row: dict) -> str:
 
 
 async def callback_command(raw_args: str = "") -> str:
-    """Slash command ``/voice-callback``; the human approval step."""
+    """Slash command ``/voice-callback``: review and deny. Approval is the native approval card."""
     parts = (raw_args or "").split()
     action = parts[0].lower() if parts else "list"
     cb_id = parts[1].lower() if len(parts) > 1 else ""
@@ -207,21 +289,18 @@ async def _run_command(action: str, cb_id: str) -> str:
                 return f"No callback {cb_id}."
             return f"Denied {cb_id}." if store.deny(cb_id) else f"{cb_id} is {row['status']}; nothing to deny."
         if action == "approve":
-            return await _approve(store, cb_id, row)
+            # A slash command cannot raise the native approval card, so it no longer dials.
+            return (f"Callbacks are approved on the approval card. Ask the assistant to place callback {cb_id}; "
+                    "it dials only if you approve the card.")
     return USAGE
 
 
-async def _approve(store: CallbackStore, cb_id: str, row: dict | None) -> str:
-    if row is None:
-        return f"No callback {cb_id}."
-    if row["status"] != "pending":
-        return f"{cb_id} is {row['status']}; only pending callbacks can be approved."
+async def _dial(store: CallbackStore, cb_id: str, row: dict | None) -> str:
+    problem = dial_problem(row, cb_id)
+    if problem:
+        return problem
     account_sid, auth_token = secret("TWILIO_ACCOUNT_SID"), secret("TWILIO_AUTH_TOKEN")
     from_number, base = secret("TWILIO_PHONE_NUMBER"), secret("VOICE_WEBHOOK_URL").strip().rstrip("/")
-    if not (account_sid and auth_token and from_number and base.startswith("https://")):
-        return "Cannot dial: set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER and an https VOICE_WEBHOOK_URL."
-    if row["destination"] not in parse_allowed(secret("VOICE_ALLOWED_USERS")):
-        return f"Refused: {row['destination']} is no longer on VOICE_ALLOWED_USERS."
     if not store.claim_for_dial(cb_id):
         return f"{cb_id} was already handled."
     try:
@@ -235,7 +314,7 @@ async def _approve(store: CallbackStore, cb_id: str, row: dict | None) -> str:
     except Exception:
         store.fail(cb_id, "unexpected error while dialing")
         logger.exception("[voice] callback %s failed unexpectedly", cb_id)
-        return "The call could not be placed (unexpected error). Check Twilio before approving a new request."
+        return "The call could not be placed (unexpected error). Check Twilio before placing a new request."
     store.set_call_sid(cb_id, call.get("sid", ""))
     logger.info("[voice] callback %s dialing %s", cb_id, redact_phone(row["destination"]))
-    return f"Dialing {row['destination']} (call {call.get('sid', '?')}). The agent will speak when they answer."
+    return f"Dialing {row['destination']} (call {call.get('sid', '?')}). The assistant will speak when they answer."

@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "hermes-voice-gateway"
 version = "0.2.0"
-description = "Hermes voice platform: Twilio phone calls handled by Hermes, with Pipecat and ElevenLabs."
+description = "Voice platform plugin: Twilio phone calls handled by the agent, with Pipecat and the business's own ElevenLabs key."
 requires-python = ">=3.11"  # pipecat-ai 1.7.0 needs 3.11+
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Shravan Rai"}]
-keywords = ["hermes", "voice", "gateway", "twilio", "pipecat", "elevenlabs", "openai"]
+keywords = ["hermes", "voice", "gateway", "twilio", "pipecat", "elevenlabs"]
 dependencies = [
-    "pipecat-ai[elevenlabs,openai,silero,webrtc,websocket]==1.7.0",
+    "pipecat-ai[elevenlabs,silero,websocket]==1.7.0",
     "uvicorn>=0.32,<1",
 ]
 
@@ -32,9 +32,8 @@ only-include = [
     "callbacks.py",
     "twilio_rest.py",
     "hooks.py",
-    "pipeline.py",
-    "refurbo_demo.py",
-    "voice/refurbo-inventory.json",
+    "hours.py",
+    "_engine.py",
     "voice_behavior.py",
     "adapter.py",
     "twilio_util.py",
